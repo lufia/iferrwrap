@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 )
 
-type methoder interface {
+type Methoder interface {
 	Method(i int) *types.Func
 	NumMethods() int
 }
@@ -22,59 +22,93 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix(filepath.Base(os.Args[0]) + ": ")
 
+	//pkgName := "database/sql"
+	//typeName := "DB"
+	pkgName := "./testdata/pkg"
+	typeName := "T"
+	if err := codegen(pkgName, typeName); err != nil {
+		log.Fatalln(err)
+	}
+}
+
+func codegen(pkgName, typeName string) error {
 	ctx := build.Default
 	//ctx.BuildTags = []string{}
-	pkg, err := ctx.Import("database/sql", ".", 0)
+	pkg, err := ctx.Import(pkgName, ".", 0)
 	if err != nil {
-		log.Fatalln(err)
+		return err
 	}
-	log.Println(pkg.Name, pkg.Dir)
-	t, err := lookupType(pkg, "DB")
+	t, err := lookupType(pkg.Dir, pkg.Name, typeName)
 	if err != nil {
-		log.Fatalln(err)
+		return err
 	}
-	log.Println(t.obj.Type())
-	m, ok := t.obj.Type().(methoder)
-	if !ok {
-		log.Fatal("no method!")
+	meths, err := t.Methods()
+	if err != nil {
+		return err
 	}
-	for i := 0; i < m.NumMethods(); i++ {
-		f := m.Method(i)
-		if !f.Exported() {
+	for _, m := range meths {
+		sig, ok := m.Type().(*types.Signature)
+		if !ok {
+			return fmt.Errorf("%v: don't have signature?", m)
+		}
+		rv := sig.Results()
+		if rv == nil || rv.Len() == 0 {
+			log.Println(m, ": void")
 			continue
 		}
-		log.Println(f.Name(), f.Type())
+		if !isErrorType(rv.At(rv.Len() - 1).Type()) {
+		}
+		log.Println(m.Name(), sig, ok)
 	}
+	return nil
 }
 
-type Type struct {
-	pkg *types.Package
-	obj types.Object
-}
-
-func lookupType(pkg *build.Package, typeName string) (*Type, error) {
-	fs := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fs, pkg.Dir, nil, 0)
-	if err != nil {
-		return nil, err
-	}
-	p, ok := pkgs[pkg.Name]
+func isErrorType(t types.Type) bool {
+	v, ok := t.(*types.Named)
 	if !ok {
-		return nil, fmt.Errorf("package %s is not exist", pkg.Name)
+		return false
+	}
+	typeName := v.Obj()
+	return typeName.Name() == "error" && typeName.Pkg() == nil
+}
+
+func parsePkg(dir, name string) (*types.Package, *types.Info, error) {
+	fs := token.NewFileSet()
+	// TODO(lufia): ParseDir(...filter(_test.go))
+	pkgs, err := parser.ParseDir(fs, dir, nil, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	pkg, ok := pkgs[name]
+	if !ok {
+		return nil, nil, fmt.Errorf("package %s is not exist", name)
 	}
 
 	cfg := types.Config{
 		Importer: importer.For("source", nil),
 	}
-	files := make([]*ast.File, 0, len(p.Files))
-	for _, f := range p.Files {
+	files := make([]*ast.File, 0, len(pkg.Files))
+	for _, f := range pkg.Files {
 		files = append(files, f)
 	}
 
-	info := types.Info{
+	info := &types.Info{
 		Defs: make(map[*ast.Ident]types.Object),
 	}
-	typesPkg, err := cfg.Check(pkg.Dir, fs, files, &info)
+	p, err := cfg.Check(dir, fs, files, info)
+	if err != nil {
+		return nil, nil, err
+	}
+	return p, info, nil
+}
+
+type Type struct {
+	pkg *types.Package
+	typ types.Type
+}
+
+func lookupType(dir, pkgName, typeName string) (*Type, error) {
+	pkg, info, err := parsePkg(dir, pkgName)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +122,23 @@ func lookupType(pkg *build.Package, typeName string) (*Type, error) {
 		if !obj.Exported() {
 			continue
 		}
-		return &Type{typesPkg, obj}, nil
+		return &Type{pkg, obj.Type()}, nil
 	}
 	return nil, fmt.Errorf("type %s.%s is not exist", pkg.Name, typeName)
+}
+
+func (t *Type) Methods() ([]*types.Func, error) {
+	m, ok := t.typ.(Methoder)
+	if !ok {
+		return nil, fmt.Errorf("no method!")
+	}
+	var meths []*types.Func
+	for i := 0; i < m.NumMethods(); i++ {
+		f := m.Method(i)
+		if !f.Exported() {
+			continue
+		}
+		meths = append(meths, f)
+	}
+	return meths, nil
 }
