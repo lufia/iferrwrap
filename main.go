@@ -43,14 +43,22 @@ func main() {
 var codeTemplate = strings.TrimSpace(`
 package {{.Package}}
 
-{{$type := printf "err%s" .Name}}
-type {{$type}} struct {
-	Val *{{.Name}}
+{{if .Imports}}
+import (
+	{{- range .Imports}}
+	{{. | printf "%q"}}
+	{{- end}}
+)
+{{end}}
+
+{{$name := printf "err%s" .Name}}
+type {{$name}} struct {
+	Val *{{.Type}}
 	Err error
 }
 
 {{range .Methods}}
-func (p *{{$type}}) {{.Name}}{{.Params}} {
+func (p *{{$name}}) {{.Name}}({{.Params}}) {
 	if p.Err != nil {
 		return
 	}
@@ -61,14 +69,62 @@ func (p *{{$type}}) {{.Name}}{{.Params}} {
 
 type methodParam struct {
 	Name    string
-	Params  *types.Tuple
+	params  *types.Tuple
 	Results *types.Tuple
 }
 
+func NewMethod(name string, params, results *types.Tuple) *methodParam {
+	return &methodParam{
+		Name:    name,
+		params:  params,
+		Results: results,
+	}
+}
+
+func (m *methodParam) Imports() []string {
+	var a []string
+	for i := 0; i < m.params.Len(); i++ {
+		v := m.params.At(i)
+		path, _ := importPath(v.Type())
+		if path == "" {
+			continue
+		}
+		a = append(a, path)
+	}
+	return Uniq(a)
+}
+
+func (m *methodParam) Params() string {
+	args := make([]string, m.params.Len())
+	for i := 0; i < m.params.Len(); i++ {
+		v := m.params.At(i)
+		typeName := canonicalType(v.Type())
+		args[i] = fmt.Sprintf("%s %s", v.Name(), typeName)
+	}
+	return strings.Join(args, ", ")
+}
+
+func importPath(t types.Type) (path, name string) {
+	p, ok := t.(*types.Named)
+	if !ok {
+		return "", t.String()
+	}
+	n := p.Obj()
+	if pkg := n.Pkg(); pkg != nil {
+		return pkg.Path(), fmt.Sprintf("%s.%s", pkg.Name(), n.Name())
+	}
+	return "", n.Name()
+}
+
+func canonicalType(t types.Type) string {
+	_, name := importPath(t)
+	return name
+}
+
 func (m *methodParam) Args() string {
-	args := make([]string, m.Params.Len())
-	for i := 0; i < m.Params.Len(); i++ {
-		v := m.Params.At(i)
+	args := make([]string, m.params.Len())
+	for i := 0; i < m.params.Len(); i++ {
+		v := m.params.At(i)
 		if v.Name() == "" {
 			args[i] = zeroValue(v.Type())
 		} else {
@@ -108,22 +164,52 @@ func (m *methodParam) isTrailingErr() bool {
 type typeParam struct {
 	Package string
 	Name    string
+	Type    string
 	Methods []*methodParam
+
+	importPaths []string
 }
 
-func codegen(w io.Writer, pkgName, typeName string) error {
+func Uniq(a []string) []string {
+	m := make(map[string]struct{})
+	for _, s := range a {
+		m[s] = struct{}{}
+	}
+	t := make([]string, 0, len(m))
+	for s := range m {
+		t = append(t, s)
+	}
+	return t
+}
+
+func (t *typeParam) Imports() []string {
+	var a []string
+	for _, m := range t.Methods {
+		a = append(a, m.Imports()...)
+	}
+	return Uniq(a)
+}
+
+func codegen(w io.Writer, pkgPath, typeName string) error {
 	tmpl := template.Must(template.New("code").Parse(codeTemplate))
 
 	ctx := build.Default
 	//ctx.BuildTags = []string{}
-	pkg, err := ctx.Import(".", ".", 0)
+	currentPkg, err := ctx.Import(".", ".", 0)
 	if err != nil {
 		return err
 	}
 	var param typeParam
-	param.Package = pkg.Name
+	param.Package = currentPkg.Name
+
+	pkg, err := parsePkg(pkgPath)
+	if err != nil {
+		return err
+	}
 	param.Name = typeName
-	meths, err := exportedMethods(pkgName, typeName)
+	param.Type = fmt.Sprintf("%s.%s", pkg.Name(), typeName)
+
+	meths, err := exportedMethods(pkg, typeName)
 	if err != nil {
 		return err
 	}
@@ -132,11 +218,8 @@ func codegen(w io.Writer, pkgName, typeName string) error {
 		if !ok {
 			return fmt.Errorf("%v: don't have signature?", m)
 		}
-		param.Methods = append(param.Methods, &methodParam{
-			Name:    m.Name(),
-			Params:  sig.Params(),
-			Results: sig.Results(),
-		})
+		p := NewMethod(m.Name(), sig.Params(), sig.Results())
+		param.Methods = append(param.Methods, p)
 	}
 	return tmpl.Execute(w, &param)
 }
@@ -153,7 +236,7 @@ func zeroValue(t types.Type) string {
 			return "0"
 		}
 	case *types.Named:
-		return fmt.Sprintf("%s{}", v.Obj().Id())
+		return fmt.Sprintf("%s{}", canonicalType(t))
 	default:
 		return "nil"
 	}
@@ -178,17 +261,13 @@ func parsePkg(pkg string) (*types.Package, error) {
 	return prog.Package(pkg).Pkg, nil
 }
 
-func exportedMethods(pkgName, typeName string) ([]*types.Func, error) {
-	pkg, err := parsePkg(pkgName)
-	if err != nil {
-		return nil, err
-	}
-	p := pkg.Scope().Lookup(typeName)
+func exportedMethods(pkg *types.Package, name string) ([]*types.Func, error) {
+	p := pkg.Scope().Lookup(name)
 	if p == nil {
-		return nil, fmt.Errorf("%s.%s is not exist", pkgName, typeName)
+		return nil, fmt.Errorf("%s.%s is not exist", pkg.Name(), name)
 	}
 	if _, ok := p.(*types.TypeName); !ok {
-		return nil, fmt.Errorf("%s.%s is not a named type", pkgName, typeName)
+		return nil, fmt.Errorf("%s.%s is not a named type", pkg.Name(), name)
 	}
 	m, ok := p.Type().(Methoder)
 	if !ok {

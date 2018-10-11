@@ -15,6 +15,10 @@ func (t T) Method4(v interface{}, err error) (string, int, error) {
 	return "", 0, nil
 }
 
+func (t T) Method5(T) (T, error) {
+	return T{}, nil
+}
+
 func F() error {
 	type T struct{}
 
